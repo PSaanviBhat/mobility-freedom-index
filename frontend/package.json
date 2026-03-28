@@ -1,0 +1,15 @@
+{
+  "name": "safety-map",
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "next dev"
+  },
+  "dependencies": {
+    "leaflet": "^1.9.4",
+    "leaflet.heat": "^0.2.0",
+    "leaflet-routing-machine": "^3.2.12",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  }
+}
