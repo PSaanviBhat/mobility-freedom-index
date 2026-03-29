@@ -17,8 +17,8 @@ from pathlib import Path
 # Load artifacts once at startup
 # --------------------------------------------------------------------------
 BASE_DIR     = Path(__file__).parent.parent
-model        = joblib.load(BASE_DIR / "ml_models" / "mobility_freedom_model.joblib")
-preprocessor = joblib.load(BASE_DIR / "ml_models" / "preprocessor.joblib")
+model        = joblib.load(BASE_DIR / "models" / "mobility_freedom_model.joblib")
+preprocessor = joblib.load(BASE_DIR / "models" / "preprocessor.joblib")
 
 with open(BASE_DIR / "data" / "city_graph.json") as f:
     _graph = json.load(f)
