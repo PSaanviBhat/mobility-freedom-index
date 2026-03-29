@@ -27,3 +27,16 @@ class HeatmapZone(BaseModel):
     lng: float
     score: float
     zone_type: str
+class RouteOption(BaseModel):
+    route_type: str
+    path_nodes: list
+    total_distance_km: float
+    mobility_freedom_score: float
+    risk_probability: float
+    is_high_risk: bool
+
+class RouteResponse(BaseModel):
+    source_id: str
+    dest_id: str
+    hour_of_day: int
+    routes: list[RouteOption]
