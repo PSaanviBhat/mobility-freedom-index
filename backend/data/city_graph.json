@@ -1,0 +1,101 @@
+{
+  "nodes": [
+    {
+      "node_id": "N1",
+      "name": "PES University (Campus)",
+      "lat": 12.9141,
+      "lng": 77.6012,
+      "base_crime_density": 0.2,
+      "crime_trend": 0.05,
+      "violence_ratio": 0.1,
+      "base_lighting": 90,
+      "base_crowd": 85,
+      "transport_availability": 8,
+      "area_type": "educational"
+    },
+    {
+      "node_id": "N2",
+      "name": "Silk Board Junction",
+      "lat": 12.9176,
+      "lng": 77.6234,
+      "base_crime_density": 0.5,
+      "crime_trend": 0.1,
+      "violence_ratio": 0.3,
+      "base_lighting": 70,
+      "base_crowd": 95,
+      "transport_availability": 9,
+      "area_type": "transit"
+    },
+    {
+      "node_id": "N3",
+      "name": "Koramangala (Safe Corridor)",
+      "lat": 12.9352,
+      "lng": 77.6245,
+      "base_crime_density": 0.2,
+      "crime_trend": 0.04,
+      "violence_ratio": 0.1,
+      "base_lighting": 88,
+      "base_crowd": 80,
+      "transport_availability": 8,
+      "area_type": "commercial"
+    },
+    {
+      "node_id": "N4",
+      "name": "MG Road (Downtown)",
+      "lat": 12.9716,
+      "lng": 77.5946,
+      "base_crime_density": 0.35,
+      "crime_trend": 0.08,
+      "violence_ratio": 0.2,
+      "base_lighting": 92,
+      "base_crowd": 88,
+      "transport_availability": 10,
+      "area_type": "commercial"
+    },
+    {
+      "node_id": "N5",
+      "name": "Majestic (High Risk)",
+      "lat": 12.9766,
+      "lng": 77.5713,
+      "base_crime_density": 0.75,
+      "crime_trend": 0.15,
+      "violence_ratio": 0.5,
+      "base_lighting": 55,
+      "base_crowd": 70,
+      "transport_availability": 9,
+      "area_type": "transit"
+    }
+  ],
+  "routes": [
+    {
+      "route_id": "R1",
+      "source_id": "N1",
+      "dest_id": "N4",
+      "name": "Fast Route (via Silk Board)",
+      "distance_km": 4.2,
+      "num_intersections": 12,
+      "path_nodes": ["N1", "N2", "N4"],
+      "route_type": "highway"
+    },
+    {
+      "route_id": "R2",
+      "source_id": "N1",
+      "dest_id": "N4",
+      "name": "Safe Route (via Koramangala)",
+      "distance_km": 6.1,
+      "num_intersections": 8,
+      "path_nodes": ["N1", "N3", "N4"],
+      "route_type": "residential"
+    },
+    {
+      "route_id": "R3",
+      "source_id": "N1",
+      "dest_id": "N4",
+      "name": "Balanced Route",
+      "distance_km": 5.0,
+      "num_intersections": 10,
+      "path_nodes": ["N1", "N2", "N3", "N4"],
+      "route_type": "mixed"
+    }
+  ]
+}
