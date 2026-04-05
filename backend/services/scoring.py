@@ -1,295 +1,191 @@
-"""
-services/scoring.py  — FINAL VERSION
-======================================
-"""
+import logging
 
-import sys
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-
-import joblib
-import json
-import numpy as np
 import pandas as pd
-from pathlib import Path
 
-# --------------------------------------------------------------------------
-# Load artifacts once at startup
-# --------------------------------------------------------------------------
-BASE_DIR     = Path(__file__).parent.parent
-model        = joblib.load(BASE_DIR / "models" / "mobility_freedom_model.joblib")
-preprocessor = joblib.load(BASE_DIR / "models" / "preprocessor.joblib")
+from .data_layer import CITY_GRAPH, FEATURE_COLUMNS, ML_PIPELINE, SAFETY_THRESHOLD
+from .recommendation import build_recommendation
 
-with open(BASE_DIR / "data" / "city_graph.json") as f:
-    _graph = json.load(f)
-    NODES  = {n["node_id"]: n for n in _graph["nodes"]}
-    ROUTES = _graph["routes"]
-
-FEATURE_ORDER = [
-    'crime_density', 'crime_trend', 'crime_type_violence_ratio',
-    'transit_lines_nearby', 'transit_frequency', 'street_connectivity',
-    'avg_lighting_quality', 'crowd_density', 'weather_visibility',
-    'hour_of_day', 'day_of_week', 'is_holiday',
-    'route_length_km', 'num_intersections'
-]
-
-_HOUR_RISK = {
-    0:1.3, 1:1.3, 2:1.3, 3:1.3, 4:1.2,
-    5:0.8, 6:0.75, 7:0.7, 8:0.65, 9:0.6,
-    10:0.6, 11:0.6, 12:0.6, 13:0.6, 14:0.6,
-    15:0.65, 16:0.7, 17:0.75, 18:0.8, 19:0.9,
-    20:1.0, 21:1.1, 22:1.2, 23:1.25
-}
+logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------
-# Step 1: Time-based feature adjustment per node
-# --------------------------------------------------------------------------
-def _apply_time_adjustments(node: dict, hour: int) -> dict:
-    if 7 <= hour <= 10 or 17 <= hour <= 20:
-        crowd = node["base_crowd"] * 1.2
-    elif 0 <= hour <= 5:
-        crowd = node["base_crowd"] * 0.1
-    else:
-        crowd = node["base_crowd"] * 0.8
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, float(value)))
 
-    lighting = 100.0 if 6 < hour < 18 else node["base_lighting"]
 
-    return {
-        "crime_density":  node["base_crime_density"],
-        "crime_trend":    node["crime_trend"],
-        "violence_ratio": node["violence_ratio"],
-        "lighting":       lighting,
-        "crowd":          min(100, crowd),
-        "transport":      node["transport_availability"]
+def _normalize_ratio(value: float, scale: float) -> float:
+    value = float(value)
+    if value <= 1.0:
+        return _clamp(value, 0.0, 1.0)
+    return _clamp(value / scale, 0.0, 1.0)
+
+
+def _prepare_feature_frame(features_dict: dict) -> pd.DataFrame:
+    row = {column: features_dict[column] for column in FEATURE_COLUMNS}
+    return pd.DataFrame([row], columns=FEATURE_COLUMNS)
+
+
+def _fallback_probability(features_dict: dict) -> float:
+    crime = _normalize_ratio(features_dict["crime_density"], 1.0)
+    lighting_penalty = 1.0 - _normalize_ratio(features_dict["avg_lighting_quality"], 100.0)
+    visibility_penalty = 1.0 - _normalize_ratio(features_dict["weather_visibility"], 10.0)
+    crowd_penalty = 1.0 - _normalize_ratio(features_dict["crowd_density"], 100.0)
+    violence = _normalize_ratio(features_dict["crime_type_violence_ratio"], 1.0)
+    night_penalty = 1.0 if int(features_dict["hour_of_day"]) >= 20 or int(features_dict["hour_of_day"]) <= 5 else 0.0
+    raw = (
+        0.38 * crime
+        + 0.18 * lighting_penalty
+        + 0.12 * visibility_penalty
+        + 0.10 * crowd_penalty
+        + 0.12 * violence
+        + 0.10 * night_penalty
+    )
+    return _clamp(raw, 0.0, 1.0)
+
+
+def aggregate_route_features(path_nodes: list[str], travel_time: int, visibility: float, actual_distance: float) -> pd.DataFrame:
+    if not path_nodes:
+        raise ValueError("Path nodes list cannot be empty.")
+
+    total_lighting = 0.0
+    total_crowd = 0.0
+    total_transit = 0.0
+    total_crime = 0.0
+    total_crime_trend = 0.0
+    total_violence = 0.0
+
+    for node_id in path_nodes:
+        node = CITY_GRAPH.nodes.get(node_id, {})
+        total_lighting += float(node.get("base_lighting", 50.0))
+        total_crowd += float(node.get("base_crowd", 50.0))
+        total_transit += float(node.get("transport_availability", 0.0))
+        total_crime += float(node.get("base_crime_density", 0.0))
+        total_crime_trend += float(node.get("crime_trend", 0.0))
+        total_violence += float(node.get("violence_ratio", 0.0))
+
+    num_nodes = len(path_nodes)
+    is_night = travel_time >= 20 or travel_time <= 5
+    avg_lighting = total_lighting / num_nodes
+    avg_crowd = total_crowd / num_nodes
+    avg_transit = total_transit / num_nodes
+
+    features_dict = {
+        "crime_density": round(total_crime / num_nodes, 4),
+        "crime_trend": round(total_crime_trend / num_nodes, 4),
+        "crime_type_violence_ratio": round(total_violence / num_nodes, 4),
+        "transit_lines_nearby": int(round(avg_transit)),
+        "transit_frequency": round(avg_transit * 4.0, 2),
+        "street_connectivity": round(_clamp((num_nodes - 1) / max(actual_distance, 1.0), 0.1, 1.0), 4),
+        "avg_lighting_quality": round(avg_lighting if is_night else min(100.0, avg_lighting + 10.0), 2),
+        "crowd_density": round(avg_crowd if not is_night else max(5.0, avg_crowd * 0.65), 2),
+        "weather_visibility": round(_clamp(visibility, 0.0, 10.0), 2),
+        "hour_of_day": int(travel_time),
+        "day_of_week": 5,
+        "is_holiday": 0,
+        "route_length_km": round(max(actual_distance, 0.1), 3),
+        "num_intersections": max(0, num_nodes - 2),
     }
+    return _prepare_feature_frame(features_dict)
 
 
-# --------------------------------------------------------------------------
-# Step 2: Aggregate node list into one ML feature vector
-# --------------------------------------------------------------------------
-def _aggregate_route_features(path_nodes: list, hour: int,
-                               weather_visibility: float,
-                               distance_km: float,
-                               num_intersections: int) -> dict:
-    adjusted = [_apply_time_adjustments(NODES[nid], hour) for nid in path_nodes]
-
-    return {
-        "crime_density":             max(n["crime_density"]  for n in adjusted),
-        "crime_trend":               float(np.mean([n["crime_trend"]  for n in adjusted])),
-        "crime_type_violence_ratio": max(n["violence_ratio"] for n in adjusted),
-        "transit_lines_nearby":      float(np.mean([n["transport"]    for n in adjusted])),
-        "transit_frequency":         float(np.mean([n["transport"]    for n in adjusted])) * 3,
-        "street_connectivity":       min(1.0, num_intersections / 20),
-        "avg_lighting_quality":      float(np.mean([n["lighting"]     for n in adjusted])),
-        "crowd_density":             float(np.mean([n["crowd"]        for n in adjusted])),
-        "weather_visibility":        weather_visibility,
-        "hour_of_day":               hour,
-        "day_of_week":               0,
-        "is_holiday":                0,
-        "route_length_km":           distance_km,
-        "num_intersections":         num_intersections
-    }
+def predict_risk_probability(feature_frame: pd.DataFrame) -> float:
+    if ML_PIPELINE is None:
+        return _fallback_probability(feature_frame.iloc[0].to_dict())
+    return _clamp(float(ML_PIPELINE.predict_proba(feature_frame)[0, 1]), 0.0, 1.0)
 
 
-# --------------------------------------------------------------------------
-# Step 3: ML inference
-# --------------------------------------------------------------------------
-def _predict_risk(features: dict) -> float:
-    row    = pd.DataFrame([{k: features[k] for k in FEATURE_ORDER}])
-    scaled = preprocessor.transform(row)
-    return float(model.predict_proba(scaled)[0][1])
-
-
-def _freedom_score(risk_prob: float, distance_km: float) -> float:
-    distance_penalty = 1 + (distance_km - 2) * 0.03
-    score = ((1 - risk_prob) * 100) / max(distance_penalty, 1.0)
-    return round(min(100, max(0, score)), 1)
-
-
-# --------------------------------------------------------------------------
-# Step 4: Explanation builder
-# --------------------------------------------------------------------------
-def _explain(features: dict, score: float) -> str:
-    lighting_label = "Excellent" if features["avg_lighting_quality"] > 75 else \
-                     "Moderate"  if features["avg_lighting_quality"] > 40 else "Poor"
-    crowd_label    = "High"      if features["crowd_density"] > 70 else \
-                     "Moderate"  if features["crowd_density"] > 30 else "Low"
-    risk_label     = "Low"       if score >= 70 else \
-                     "Moderate"  if score >= 45 else "High"
-    emoji          = "🟢" if score >= 70 else "🟡" if score >= 45 else "🔴"
-
-    return (f"{emoji} Mobility Freedom Score: {score}/100 — "
-            f"Lighting: {lighting_label} | Crowd: {crowd_label} | ML Risk: {risk_label}")
-
-
-# --------------------------------------------------------------------------
-# compare_routes — called from POST /api/v1/routes/compare
-# --------------------------------------------------------------------------
-def compare_routes(source_id: str, dest_id: str,
-                   hour_of_day: int,
-                   weather_visibility: float = 10.0) -> dict:
-    """
-    Input:
-        source_id          : node id e.g. "N1"
-        dest_id            : node id e.g. "N5"
-        hour_of_day        : 0-23
-        weather_visibility : 10=clear, 5=rain, 2=fog
-
-    Output:
-        {
-            "routes":      [ list of scored route objects ],
-            "recommended": { the highest scoring route },
-            "source":      { source node info },
-            "dest":        { dest node info }
-        }
-    """
-    if source_id == dest_id:
-        return {"error": "Source and destination cannot be the same."}
-
-    found = [r for r in ROUTES
-             if r["source_id"] == source_id and r["dest_id"] == dest_id]
-
-    if not found:
-        return {"error": "No routes available for this zone yet."}
-
-    scored_routes = []
-    for route in found:
-        features  = _aggregate_route_features(
-            route["path_nodes"], hour_of_day,
-            weather_visibility, route["distance_km"], route["num_intersections"]
-        )
-        risk_prob = _predict_risk(features)
-        score     = _freedom_score(risk_prob, route["distance_km"])
-
-        scored_routes.append({
-            "route_id":    route["route_id"],
-            "name":        route["name"],
-            "route_type":  route["route_type"],
-            "distance_km": route["distance_km"],
-            "polyline":    route["polyline"],
-            "score":       score,
-            "risk_level":  "low" if score >= 70 else "medium" if score >= 45 else "high",
-            "explanation": _explain(features, score),
-            "components": {
-                "lighting": round(features["avg_lighting_quality"], 1),
-                "crowd":    round(features["crowd_density"], 1),
-                "crime":    round(features["crime_density"] * 100, 1),
-                "transit":  round(features["transit_lines_nearby"], 1)
-            }
-        })
-
-    recommended = max(scored_routes, key=lambda x: x["score"])
-
-    return {
-        "routes":      scored_routes,
-        "recommended": recommended,
-        "source":      NODES.get(source_id, {}),
-        "dest":        NODES.get(dest_id, {})
-    }
-
-
-# --------------------------------------------------------------------------
-# compute_mobility_score — called by BOTH routers as-is, no changes needed
-# Handles two different feature formats:
-#   Format A (from routes.py): already aggregated node features
-#   Format B (from score.py):  raw location-level features
-# --------------------------------------------------------------------------
 def compute_mobility_score(features: dict) -> dict:
-    """
-    Drop-in replacement for the stub.
-    Returns same keys their backend expects:
-        mobility_freedom_score, safety_score, accessibility_score, visibility_score
-    """
+    hour_of_day = int(features.get("hour_of_day", features.get("hour", 12)))
+    day_of_week = int(features.get("day_of_week", 5 if features.get("is_weekend") else 2))
+    is_holiday = int(bool(features.get("is_holiday", False)))
+    crime_density = _clamp(features.get("crime_density", features.get("crime_index", 0.3)), 0.0, 1.0)
+    violence_ratio = _clamp(features.get("crime_type_violence_ratio", crime_density * 0.75), 0.0, 1.0)
+    lighting_quality = features.get("avg_lighting_quality", features.get("lighting_index", 65.0))
+    if float(lighting_quality) <= 1.0:
+        lighting_quality = float(lighting_quality) * 100.0
+    weather_visibility = features.get("weather_visibility", features.get("lighting_index", 7.0))
+    if float(weather_visibility) <= 1.0:
+        weather_visibility = float(weather_visibility) * 10.0
+    crowd_density = features.get("crowd_density", 45.0)
+    if float(crowd_density) <= 1.0:
+        crowd_density = float(crowd_density) * 100.0
+    transit_access = float(features.get("transit_access", 0.6))
 
-    # --- Format A: comes from routes.py aggregate_features() ---
-    # keys: crime_density, crime_trend, violence_ratio, lighting,
-    #       crowd_density, transport_availability, weather_visibility, hour_of_day
-    if "lighting" in features and "transport_availability" in features:
-        ml_features = {
-            "crime_density":             features.get("crime_density", 0.3),
-            "crime_trend":               features.get("crime_trend", 0.0),
-            "crime_type_violence_ratio": features.get("violence_ratio", 0.2),
-            "transit_lines_nearby":      features.get("transport_availability", 5.0),
-            "transit_frequency":         features.get("transport_availability", 5.0) * 3,
-            "street_connectivity":       0.5,
-            "avg_lighting_quality":      features.get("lighting", 70.0),
-            "crowd_density":             features.get("crowd_density", 50.0),
-            "weather_visibility":        features.get("weather_visibility", 10.0),
-            "hour_of_day":               features.get("hour_of_day", 12),
-            "day_of_week":               0,
-            "is_holiday":                0,
-            "route_length_km":           features.get("route_length_km", 4.0),
-            "num_intersections":         features.get("num_intersections", 10),
-        }
+    model_features = {
+        "crime_density": round(crime_density, 4),
+        "crime_trend": round(float(features.get("crime_trend", 0.05)), 4),
+        "crime_type_violence_ratio": round(violence_ratio, 4),
+        "transit_lines_nearby": int(round(max(0.0, transit_access * 10.0))),
+        "transit_frequency": round(max(0.0, transit_access * 12.0), 2),
+        "street_connectivity": round(_clamp(features.get("street_connectivity", 0.7), 0.0, 1.0), 4),
+        "avg_lighting_quality": round(_clamp(lighting_quality, 0.0, 100.0), 2),
+        "crowd_density": round(_clamp(crowd_density, 0.0, 100.0), 2),
+        "weather_visibility": round(_clamp(weather_visibility, 0.0, 10.0), 2),
+        "hour_of_day": hour_of_day,
+        "day_of_week": day_of_week,
+        "is_holiday": is_holiday,
+        "route_length_km": round(max(0.2, float(features.get("route_length_km", 1.5))), 3),
+        "num_intersections": int(max(0, round(float(features.get("num_intersections", 4))))),
+    }
 
-    # --- Format B: comes from score.py (lat/lng level, 0-1 normalised values) ---
-    # keys: hour, lighting_index, crime_index, crowd_density, transit_access
-    else:
-        ml_features = {
-            "crime_density":             features.get("crime_index", 0.3),
-            "crime_trend":               0.0,
-            "crime_type_violence_ratio": features.get("crime_index", 0.3) * 0.5,
-            "transit_lines_nearby":      features.get("transit_access", 0.5) * 10,
-            "transit_frequency":         features.get("transit_access", 0.5) * 30,
-            "street_connectivity":       0.5,
-            "avg_lighting_quality":      features.get("lighting_index", 0.7) * 100,
-            "crowd_density":             features.get("crowd_density", 0.4) * 100,
-            "weather_visibility":        features.get("weather_visibility", 10.0),
-            "hour_of_day":               features.get("hour", 12),
-            "day_of_week":               0,
-            "is_holiday":                0,
-            "route_length_km":           4.0,
-            "num_intersections":         10,
-        }
-
-    # Run ML inference
-    risk_prob = _predict_risk(ml_features)
-    hour      = int(ml_features["hour_of_day"])
-    time_adj  = (1.0 - _HOUR_RISK[hour]) * 15
-    score     = round(min(100, max(0, (1 - risk_prob) * 100 + time_adj)), 1)
+    feature_frame = _prepare_feature_frame(model_features)
+    risk_probability = predict_risk_probability(feature_frame)
+    safety_score = round(_clamp((1.0 - risk_probability) * 100.0, 0.0, 100.0), 2)
+    visibility_score = round(
+        _clamp(
+            (0.55 * model_features["avg_lighting_quality"]) + (4.5 * model_features["weather_visibility"]),
+            0.0,
+            100.0,
+        ),
+        2,
+    )
+    accessibility_score = round(
+        _clamp(
+            (model_features["transit_lines_nearby"] * 6.0)
+            + (model_features["street_connectivity"] * 25.0)
+            + (model_features["crowd_density"] * 0.15),
+            0.0,
+            100.0,
+        ),
+        2,
+    )
+    mobility_freedom_score = round(
+        _clamp((0.6 * safety_score) + (0.2 * visibility_score) + (0.2 * accessibility_score), 0.0, 100.0),
+        2,
+    )
 
     return {
-        "mobility_freedom_score": score,
-        "safety_score":           round(max(0, 100 - ml_features["crime_density"] * 100), 1),
-        "accessibility_score":    round(min(100, ml_features["transit_lines_nearby"] * 10), 1),
-        "visibility_score":       round(ml_features["avg_lighting_quality"], 1),
+        "mobility_freedom_score": mobility_freedom_score,
+        "safety_score": safety_score,
+        "accessibility_score": accessibility_score,
+        "visibility_score": visibility_score,
+        "risk_probability": round(risk_probability, 6),
+        "engine_mode": "ml_pipeline" if ML_PIPELINE is not None else "fallback_rule_based",
+        "features": model_features,
     }
 
 
-# --------------------------------------------------------------------------
-# Sanity check — run: python services/scoring.py
-# --------------------------------------------------------------------------
-if __name__ == "__main__":
-    print("=" * 55)
-    print("TEST 1: compare_routes() — 2 PM (safe)")
-    print("=" * 55)
-    r = compare_routes("N1", "N5", hour_of_day=14)
-    for route in r["routes"]:
-        print(f"  {route['name']}: {route['score']} | {route['risk_level']}")
-    print(f"  → Recommended: {r['recommended']['name']}")
+def calculate_route_risk(path_nodes: list[str], travel_time: int, visibility: float, actual_distance: float):
+    feature_frame = aggregate_route_features(path_nodes, travel_time, visibility, actual_distance)
+    probability = predict_risk_probability(feature_frame)
+    score = round(_clamp((1.0 - probability) * 100.0, 0.0, 100.0), 2)
+    is_risky = bool(probability >= SAFETY_THRESHOLD)
+    return score, round(probability, 4), is_risky, feature_frame.iloc[0].to_dict()
 
-    print("\n" + "=" * 55)
-    print("TEST 2: compare_routes() — 11 PM (risky)")
-    print("=" * 55)
-    r2 = compare_routes("N1", "N5", hour_of_day=23)
-    for route in r2["routes"]:
-        print(f"  {route['name']}: {route['score']} | {route['risk_level']}")
-    print(f"  → Recommended: {r2['recommended']['name']}")
 
-    print("\n" + "=" * 55)
-    print("TEST 3: compute_mobility_score() — their old interface")
-    print("=" * 55)
-    old_style = compute_mobility_score({
-        "source_id": "N1",
-        "dest_id":   "N5",
-        "hour":      23,
-        "weather_visibility": 10
-    })
-    print(f"  mobility_freedom_score : {old_style['mobility_freedom_score']}")
-    print(f"  safety_score           : {old_style['safety_score']}")
-    print(f"  accessibility_score    : {old_style['accessibility_score']}")
-    print(f"  visibility_score       : {old_style['visibility_score']}")
-    print(f"  recommended_route      : {old_style['recommended_route']}")
-    print(f"  explanation            : {old_style['explanation']}")
+def derive_risk_level(mobility_freedom_score: float) -> str:
+    score = float(mobility_freedom_score)
+    if score >= 70.0:
+        return "low"
+    if score >= 45.0:
+        return "medium"
+    return "high"
 
+
+def get_integrity_meta() -> dict:
+    from .data_layer import FEATURE_SCHEMA_VERSION, MODEL_VERSION, SCORING_POLICY_VERSION
+
+    return {
+        "model_version": MODEL_VERSION,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "scoring_policy_version": SCORING_POLICY_VERSION,
+    }

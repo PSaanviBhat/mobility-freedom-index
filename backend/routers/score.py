@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from models.schemas import LocationInput, MobilityScoreResponse
-from services.scoring import compute_mobility_score
+from services.scoring import compute_mobility_score, derive_risk_level, build_recommendation, get_integrity_meta
 from services.data_layer import get_weather_visibility, get_time_features, get_mock_crime_index
 
 router = APIRouter()
@@ -21,18 +21,22 @@ async def get_mobility_score(location: LocationInput):
 
     scores = compute_mobility_score(features)
     mfs = scores["mobility_freedom_score"]
-    risk = "low" if mfs > 65 else "medium" if mfs > 40 else "high"
-    tip = generate_recommendation(risk, time_features["is_night"])
+    risk = derive_risk_level(mfs)
+    tip = build_recommendation(risk, time_features["is_night"])
+    meta = get_integrity_meta()
 
     return MobilityScoreResponse(
-        lat=location.lat, lng=location.lng,
-        recommendation=tip, risk_level=risk,
-        **scores
+        lat=location.lat,
+        lng=location.lng,
+        mobility_freedom_score=scores["mobility_freedom_score"],
+        safety_score=scores["safety_score"],
+        accessibility_score=scores["accessibility_score"],
+        visibility_score=scores["visibility_score"],
+        risk_probability=scores["risk_probability"],
+        risk_level=risk,
+        recommendation=tip,
+        model_version=meta["model_version"],
+        feature_schema_version=meta["feature_schema_version"],
+        scoring_policy_version=meta["scoring_policy_version"],
+        engine_mode=scores["engine_mode"],
     )
-
-def generate_recommendation(risk: str, is_night: bool) -> str:
-    if risk == "high":
-        return "This area has elevated risk. Consider a ride-hail or a well-lit alternate route."
-    elif is_night:
-        return "Lower visibility at this hour. Stick to main roads with active foot traffic."
-    return "This zone looks relatively safe. Stay aware of your surroundings."
